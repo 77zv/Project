@@ -2,11 +2,11 @@
 CISC 474 – Coverage Tournament  ·  Training Script
 ====================================================
 Implements:
-  • 2 observation spaces   (Obs1 = flat simplified grid, Obs2 = local view + globals)
-  • 3 reward functions     (R1 sparse, R2 shaped, R3 dense progress)
-  • PPO from Stable Baselines 3
+  • 2 CNN observation spaces  (Obs1 = single-channel ID grid, Obs2 = 5-channel semantic)
+  • 3 reward functions        (R1 sparse, R2 shaped, R3 dense progress)
+  • PPO + custom small CNN feature extractor (Stable Baselines 3)
   • Experiment loop with plot generation
-  • Final best-model training on random maps + all predefined maps
+  • Final best-model training (two-phase: random maps → predefined maps)
 
 Run:   python3 train.py
 Output:
@@ -18,29 +18,29 @@ import os
 import numpy as np
 import gymnasium as gym
 import matplotlib
-matplotlib.use("Agg")          # headless backend (no display needed)
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Register the custom environments
-import coverage_gridworld        # noqa: F401  (side-effect: registers envs)
+import torch as th
+import torch.nn as nn
+
+import coverage_gridworld  # noqa: F401  registers environments
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-GRID_SIZE      = 10
-LOCAL_VIEW     = 5
-HALF           = LOCAL_VIEW // 2
-
-EXPERIMENT_STEPS = 300_000   # timesteps per experiment run
-FINAL_STEPS      = 2_000_000 # timesteps for the final best model
+GRID_SIZE        = 10
+EXPERIMENT_STEPS = 300_000
+FINAL_STEPS      = 2_000_000
 
 os.makedirs("plots", exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# Color → integer ID helpers  (keep in sync with custom.py)
+# Color → ID helpers
 # ---------------------------------------------------------------------------
 _BLACK     = (0,   0,   0)
 _WHITE     = (255, 255, 255)
@@ -51,92 +51,115 @@ _RED       = (255, 0,   0)
 _LIGHT_RED = (255, 127, 127)
 
 _COLOR_MAP = {
-    _BLACK:     0,
-    _WHITE:     1,
-    _BROWN:     2,
-    _GREY:      3,
-    _GREEN:     4,
-    _RED:       5,
-    _LIGHT_RED: 6,
+    _BLACK: 0, _WHITE: 1, _BROWN: 2, _GREY: 3,
+    _GREEN: 4, _RED: 5, _LIGHT_RED: 6,
 }
 
 def _rgb_to_id(rgb):
     return _COLOR_MAP.get((int(rgb[0]), int(rgb[1]), int(rgb[2])), 0)
 
 def _to_id_grid(grid):
-    id_grid = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.int8)
+    ids = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.int8)
     for r in range(GRID_SIZE):
         for c in range(GRID_SIZE):
-            id_grid[r, c] = _rgb_to_id(grid[r, c])
-    return id_grid
-
-def _find_agent(id_grid):
-    pos = np.argwhere(id_grid == 3)
-    if len(pos):
-        return int(pos[0][0]), int(pos[0][1])
-    return 0, 0
+            ids[r, c] = _rgb_to_id(grid[r, c])
+    return ids
 
 
 # ===========================================================================
-# OBSERVATION SPACE 1 – Flat simplified grid
+# Custom CNN Feature Extractor
 # ===========================================================================
-# Maps each cell of the 10×10 grid to an integer ID (0-6).
-# Shape: (100,)  Values: 0.0–6.0
-# Rationale: Complete global map view; simple baseline for comparison.
-# Downside: Large input space, may not generalise to unseen maps as well.
+# SB3's default NatureCNN is designed for 84×84 images and uses large kernels
+# (8×8, 4×4) that are inappropriate for a 10×10 grid. This small CNN uses
+# 3×3 kernels with padding to preserve spatial dimensions.
+
+class SmallGridCNN(BaseFeaturesExtractor):
+    """
+    Two-layer CNN for 10×10 grid observations.
+    Expected input shape: (C, H, W)  – channel-first, as required by PyTorch.
+    """
+    def __init__(self, observation_space, features_dim: int = 128):
+        super().__init__(observation_space, features_dim)
+
+        n_channels = observation_space.shape[0]   # (C, H, W) → C
+        h          = observation_space.shape[1]
+        w          = observation_space.shape[2]
+
+        self.cnn = nn.Sequential(
+            nn.Conv2d(n_channels, 16, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        # After two same-padding convolutions the spatial size is unchanged
+        flat_size = 32 * h * w
+        self.head = nn.Sequential(
+            nn.Linear(flat_size, features_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, obs: th.Tensor) -> th.Tensor:
+        return self.head(self.cnn(obs))
+
+
+CNN_POLICY_KWARGS = dict(
+    features_extractor_class=SmallGridCNN,
+    features_extractor_kwargs=dict(features_dim=128),
+)
+
+
+# ===========================================================================
+# OBSERVATION SPACE 1 – Single-channel ID grid  (CNN)
+# ===========================================================================
+# The full 10×10 grid encoded as a single float channel.
+# Shape: (1, 10, 10),  values: 0.0–6.0
+# Rationale: Complete global view; simple baseline for CNN comparison.
 
 def obs1_space():
-    return gym.spaces.Box(low=0.0, high=6.0, shape=(100,), dtype=np.float32)
+    return gym.spaces.Box(low=0.0, high=6.0,
+                          shape=(1, GRID_SIZE, GRID_SIZE),
+                          dtype=np.float32)
 
 def obs1_fn(grid):
-    """Return the full 10×10 grid as 100 integer IDs."""
-    id_grid = _to_id_grid(grid)
-    return id_grid.flatten().astype(np.float32)
+    """Full grid as a single-channel (1, 10, 10) float image."""
+    return _to_id_grid(grid).reshape(1, GRID_SIZE, GRID_SIZE).astype(np.float32)
 
 
 # ===========================================================================
-# OBSERVATION SPACE 2 – Local 5×5 view + global scalars  (BEST)
+# OBSERVATION SPACE 2 – 5-channel semantic grid  (CNN, BEST)
 # ===========================================================================
-# A compact 27-element vector:
-#   25 floats – 5×5 local view centred on the agent (cell IDs 0-6)
-#    1 float  – map coverage ratio ∈ [0, 1]
-#    1 float  – binary enemy-threat flag in local area
-# Rationale: Compact, translation-invariant; generalises to unseen maps.
+# Each channel is a binary mask for one semantic category:
+#   0 – agent position
+#   1 – explored cells
+#   2 – unexplored cells
+#   3 – enemy FOV (danger)
+#   4 – obstacles (walls + enemies)
+# Shape: (5, 10, 10),  values: 0.0 or 1.0
+# Rationale: Clean per-channel signals let the CNN learn specialized filters.
+# Translation-invariant and generalises to unseen maps.
 
 def obs2_space():
-    n = LOCAL_VIEW * LOCAL_VIEW + 2
-    low  = np.zeros(n, dtype=np.float32)
-    high = np.concatenate([np.full(LOCAL_VIEW * LOCAL_VIEW, 6.0),
-                           np.array([1.0, 1.0])]).astype(np.float32)
-    return gym.spaces.Box(low=low, high=high, dtype=np.float32)
+    return gym.spaces.Box(low=0.0, high=1.0,
+                          shape=(5, GRID_SIZE, GRID_SIZE),
+                          dtype=np.float32)
 
 def obs2_fn(grid):
-    """Return 5×5 local view + coverage ratio + enemy threat flag."""
-    id_grid = _to_id_grid(grid)
-    ar, ac  = _find_agent(id_grid)
-
-    # 5×5 local view; out-of-bounds cells default to wall (ID = 2)
-    local = np.full((LOCAL_VIEW, LOCAL_VIEW), 2.0, dtype=np.float32)
-    for di in range(-HALF, HALF + 1):
-        for dj in range(-HALF, HALF + 1):
-            r, c = ar + di, ac + dj
-            if 0 <= r < GRID_SIZE and 0 <= c < GRID_SIZE:
-                local[di + HALF, dj + HALF] = float(id_grid[r, c])
-
-    explored = int(np.sum((id_grid == 1) | (id_grid == 3) | (id_grid == 6)))
-    total    = GRID_SIZE * GRID_SIZE - int(np.sum(id_grid == 2)) - int(np.sum(id_grid == 4))
-    coverage = float(explored) / max(total, 1)
-    enemy_threat = float(np.any((local == 5) | (local == 6)))
-
-    return np.concatenate([local.flatten(), [coverage, enemy_threat]]).astype(np.float32)
+    """5-channel binary (5, 10, 10) semantic image."""
+    ids = _to_id_grid(grid)
+    ch = np.stack([
+        (ids == 3).astype(np.float32),                  # agent
+        ((ids == 1) | (ids == 6)).astype(np.float32),   # explored
+        (ids == 0).astype(np.float32),                  # unexplored
+        ((ids == 5) | (ids == 6)).astype(np.float32),   # enemy FOV
+        ((ids == 2) | (ids == 4)).astype(np.float32),   # obstacles
+    ], axis=0)
+    return ch
 
 
 # ===========================================================================
 # REWARD FUNCTION 1 – Sparse
 # ===========================================================================
-# Only rewards covering new cells and penalises death.
-# Rationale: Simplest possible signal; hard credit-assignment problem.
-
 def reward1(info):
     r = 0.0
     if info["new_cell_covered"]:
@@ -147,11 +170,8 @@ def reward1(info):
 
 
 # ===========================================================================
-# REWARD FUNCTION 2 – Shaped with completion bonus + time penalty
+# REWARD FUNCTION 2 – Shaped (completion bonus + time penalty)
 # ===========================================================================
-# Adds:  +50 for winning, −0.01/step time penalty.
-# Rationale: Winning bonus encourages finishing; time penalty rewards speed.
-
 def reward2(info):
     r = 0.0
     if info["new_cell_covered"]:
@@ -167,10 +187,6 @@ def reward2(info):
 # ===========================================================================
 # REWARD FUNCTION 3 – Dense with progress bonus  (BEST)
 # ===========================================================================
-# Adds a scaled bonus that grows as coverage increases, making later cells
-# more valuable. Also gives a larger completion bonus.
-# Rationale: Denser signal eases training; progress bonus fights plateau.
-
 def reward3(info):
     r = 0.0
     if info["new_cell_covered"]:
@@ -185,24 +201,19 @@ def reward3(info):
 
 
 # ===========================================================================
-# Generic Wrapper – plugs any (obs_fn, obs_space, reward_fn) into the env
+# Experiment Wrapper
 # ===========================================================================
 
 class ExperimentWrapper(gym.Wrapper):
-    """
-    Wraps the base CoverageGridworld environment to use a custom observation
-    function and reward function, bypassing custom.py's defaults.
-    """
     def __init__(self, env, obs_fn, obs_space, reward_fn):
         super().__init__(env)
-        self._obs_fn     = obs_fn
-        self._reward_fn  = reward_fn
+        self._obs_fn    = obs_fn
+        self._reward_fn = reward_fn
         self.observation_space = obs_space
 
     def reset(self, **kwargs):
         _, info = self.env.reset(**kwargs)
-        obs = self._obs_fn(self.env.unwrapped.grid)
-        return obs, info
+        return self._obs_fn(self.env.unwrapped.grid), info
 
     def step(self, action):
         _, _, terminated, truncated, info = self.env.step(action)
@@ -212,95 +223,68 @@ class ExperimentWrapper(gym.Wrapper):
 
 
 # ===========================================================================
-# Callback – tracks per-episode stats during training
+# Training callback
 # ===========================================================================
 
 class TrainingCallback(BaseCallback):
     def __init__(self):
         super().__init__()
-        self.episode_rewards  = []
-        self.episode_lengths  = []
-        self.coverage_ratios  = []
+        self.episode_rewards = []
+        self.coverage_ratios = []
         self._ep_reward = 0.0
-        self._ep_len    = 0
         self._last_info = {}
 
     def _on_step(self):
         self._ep_reward += float(self.locals["rewards"][0])
-        self._ep_len    += 1
-        if "infos" in self.locals and self.locals["infos"]:
+        if self.locals.get("infos"):
             self._last_info = self.locals["infos"][0]
-
         if self.locals["dones"][0]:
             self.episode_rewards.append(self._ep_reward)
-            self.episode_lengths.append(self._ep_len)
             if self._last_info:
-                covered   = self._last_info.get("total_covered_cells", 1)
-                coverable = self._last_info.get("coverable_cells", 1)
-                self.coverage_ratios.append(covered / max(coverable, 1))
+                c = self._last_info.get("total_covered_cells", 1)
+                t = self._last_info.get("coverable_cells", 1)
+                self.coverage_ratios.append(c / max(t, 1))
             self._ep_reward = 0.0
-            self._ep_len    = 0
         return True
 
 
 # ===========================================================================
-# Plotting helpers
+# Plotting
 # ===========================================================================
 
-def _smooth(values, window=20):
-    if len(values) < window:
-        return values
-    kernel = np.ones(window) / window
-    return np.convolve(values, kernel, mode="valid")
+def _smooth(v, w=20):
+    if len(v) < w:
+        return v
+    return np.convolve(v, np.ones(w) / w, mode="valid")
 
 def plot_experiment(cb, label, filename):
     fig, axes = plt.subplots(2, 1, figsize=(10, 8))
-
-    rewards  = cb.episode_rewards
-    coverage = cb.coverage_ratios
-
-    axes[0].plot(_smooth(rewards), label=f"{label} (smoothed)")
+    axes[0].plot(_smooth(cb.episode_rewards), label=label)
     axes[0].set_title(f"{label} – Episode Reward")
-    axes[0].set_xlabel("Episode")
-    axes[0].set_ylabel("Total Reward")
-    axes[0].legend()
-    axes[0].grid(True)
+    axes[0].set_xlabel("Episode"); axes[0].set_ylabel("Total Reward")
+    axes[0].legend(); axes[0].grid(True)
 
-    axes[1].plot(_smooth(coverage), label=f"{label} (smoothed)", color="orange")
-    axes[1].set_title(f"{label} – Coverage Ratio at Episode End")
-    axes[1].set_xlabel("Episode")
-    axes[1].set_ylabel("Coverage (fraction)")
-    axes[1].set_ylim(0, 1.05)
-    axes[1].legend()
-    axes[1].grid(True)
+    axes[1].plot(_smooth(cb.coverage_ratios), color="orange", label=label)
+    axes[1].set_title(f"{label} – Coverage Ratio")
+    axes[1].set_xlabel("Episode"); axes[1].set_ylabel("Coverage fraction")
+    axes[1].set_ylim(0, 1.05); axes[1].legend(); axes[1].grid(True)
 
     plt.tight_layout()
     plt.savefig(f"plots/{filename}.png", dpi=120)
     plt.close()
     print(f"  [plot saved] plots/{filename}.png")
 
-
 def plot_comparison(results):
-    """Plot all experiments on one figure for easy comparison."""
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-
     for label, cb in results.items():
-        axes[0].plot(_smooth(cb.episode_rewards, window=30), label=label)
-        axes[1].plot(_smooth(cb.coverage_ratios, window=30), label=label)
-
+        axes[0].plot(_smooth(cb.episode_rewards, 30), label=label)
+        axes[1].plot(_smooth(cb.coverage_ratios, 30), label=label)
     axes[0].set_title("Episode Reward – All Experiments")
-    axes[0].set_xlabel("Episode")
-    axes[0].set_ylabel("Total Reward (smoothed)")
-    axes[0].legend(fontsize=8)
-    axes[0].grid(True)
-
+    axes[0].set_xlabel("Episode"); axes[0].set_ylabel("Reward (smoothed)")
+    axes[0].legend(fontsize=8); axes[0].grid(True)
     axes[1].set_title("Coverage Ratio – All Experiments")
-    axes[1].set_xlabel("Episode")
-    axes[1].set_ylabel("Coverage fraction (smoothed)")
-    axes[1].set_ylim(0, 1.05)
-    axes[1].legend(fontsize=8)
-    axes[1].grid(True)
-
+    axes[1].set_xlabel("Episode"); axes[1].set_ylabel("Coverage (smoothed)")
+    axes[1].set_ylim(0, 1.05); axes[1].legend(fontsize=8); axes[1].grid(True)
     plt.tight_layout()
     plt.savefig("plots/comparison.png", dpi=120)
     plt.close()
@@ -308,80 +292,34 @@ def plot_comparison(results):
 
 
 # ===========================================================================
-# Predefined maps for training diversity
+# Maps
 # ===========================================================================
 
 PREDEFINED_MAPS = [
-    # Map 0 – open field (no enemies)
-    [
-        [3, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    ],
-    # Map 1 – safe (walls, no enemies)
-    [
-        [3, 0, 0, 2, 0, 2, 0, 0, 0, 0],
-        [0, 2, 0, 0, 0, 2, 0, 0, 2, 0],
-        [0, 2, 0, 2, 2, 2, 2, 2, 2, 0],
-        [0, 2, 0, 0, 0, 2, 0, 0, 0, 0],
-        [0, 2, 0, 2, 0, 2, 0, 0, 2, 0],
-        [0, 2, 0, 0, 0, 0, 0, 2, 0, 0],
-        [0, 2, 2, 2, 0, 0, 0, 2, 0, 0],
-        [0, 0, 0, 0, 0, 2, 0, 0, 2, 0],
-        [0, 2, 0, 2, 0, 2, 2, 0, 0, 0],
-        [0, 0, 0, 0, 0, 2, 0, 0, 0, 0],
-    ],
-    # Map 2 – maze (2 enemies)
-    [
-        [3, 2, 0, 0, 0, 0, 2, 0, 0, 0],
-        [0, 2, 0, 2, 2, 0, 2, 0, 2, 2],
-        [0, 2, 0, 2, 0, 0, 2, 0, 0, 0],
-        [0, 2, 0, 2, 0, 2, 2, 2, 2, 0],
-        [0, 2, 0, 2, 0, 0, 2, 0, 0, 0],
-        [0, 2, 0, 2, 2, 0, 2, 0, 2, 2],
-        [0, 2, 0, 2, 0, 0, 2, 0, 0, 0],
-        [0, 2, 0, 2, 0, 2, 2, 2, 2, 0],
-        [0, 2, 0, 2, 0, 4, 2, 4, 0, 0],
-        [0, 0, 0, 2, 0, 0, 0, 0, 0, 0],
-    ],
-    # Map 3 – chokepoint (3 enemies)
-    [
-        [3, 0, 2, 0, 0, 0, 0, 2, 0, 0],
-        [0, 0, 2, 0, 0, 0, 0, 0, 0, 4],
-        [0, 0, 2, 0, 0, 0, 0, 2, 0, 0],
-        [0, 0, 2, 0, 0, 0, 0, 2, 0, 0],
-        [0, 4, 2, 0, 0, 0, 0, 2, 0, 0],
-        [0, 0, 2, 0, 0, 0, 0, 2, 0, 0],
-        [0, 0, 2, 0, 0, 0, 0, 2, 0, 0],
-        [0, 0, 2, 0, 0, 0, 0, 2, 0, 0],
-        [0, 0, 0, 0, 4, 0, 4, 2, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 2, 0, 0],
-    ],
-    # Map 4 – sneaky enemies (5 enemies)
-    [
-        [3, 0, 0, 0, 0, 0, 0, 4, 0, 0],
-        [0, 2, 0, 2, 0, 0, 2, 0, 2, 0],
-        [0, 0, 0, 0, 4, 0, 0, 0, 0, 0],
-        [0, 2, 0, 2, 0, 0, 2, 0, 2, 0],
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, 2, 0, 2, 0, 0, 2, 0, 2, 0],
-        [4, 0, 0, 0, 0, 0, 0, 0, 0, 4],
-        [0, 2, 0, 2, 0, 0, 2, 0, 2, 0],
-        [0, 0, 0, 0, 0, 4, 0, 0, 0, 0],
-        [0, 2, 0, 2, 0, 0, 2, 0, 2, 0],
-    ],
+    [[3,0,0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0,0,0],
+     [0,0,0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0,0,0],
+     [0,0,0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0,0,0],
+     [0,0,0,0,0,0,0,0,0,0]],
+    [[3,0,0,2,0,2,0,0,0,0],[0,2,0,0,0,2,0,0,2,0],[0,2,0,2,2,2,2,2,2,0],
+     [0,2,0,0,0,2,0,0,0,0],[0,2,0,2,0,2,0,0,2,0],[0,2,0,0,0,0,0,2,0,0],
+     [0,2,2,2,0,0,0,2,0,0],[0,0,0,0,0,2,0,0,2,0],[0,2,0,2,0,2,2,0,0,0],
+     [0,0,0,0,0,2,0,0,0,0]],
+    [[3,2,0,0,0,0,2,0,0,0],[0,2,0,2,2,0,2,0,2,2],[0,2,0,2,0,0,2,0,0,0],
+     [0,2,0,2,0,2,2,2,2,0],[0,2,0,2,0,0,2,0,0,0],[0,2,0,2,2,0,2,0,2,2],
+     [0,2,0,2,0,0,2,0,0,0],[0,2,0,2,0,2,2,2,2,0],[0,2,0,2,0,4,2,4,0,0],
+     [0,0,0,2,0,0,0,0,0,0]],
+    [[3,0,2,0,0,0,0,2,0,0],[0,0,2,0,0,0,0,0,0,4],[0,0,2,0,0,0,0,2,0,0],
+     [0,0,2,0,0,0,0,2,0,0],[0,4,2,0,0,0,0,2,0,0],[0,0,2,0,0,0,0,2,0,0],
+     [0,0,2,0,0,0,0,2,0,0],[0,0,2,0,0,0,0,2,0,0],[0,0,0,0,4,0,4,2,0,0],
+     [0,0,0,0,0,0,0,2,0,0]],
+    [[3,0,0,0,0,0,0,4,0,0],[0,2,0,2,0,0,2,0,2,0],[0,0,0,0,4,0,0,0,0,0],
+     [0,2,0,2,0,0,2,0,2,0],[0,0,0,0,0,0,0,0,0,0],[0,2,0,2,0,0,2,0,2,0],
+     [4,0,0,0,0,0,0,0,0,4],[0,2,0,2,0,0,2,0,2,0],[0,0,0,0,0,4,0,0,0,0],
+     [0,2,0,2,0,0,2,0,2,0]],
 ]
 
 
 def make_env(obs_fn, obs_space_fn, reward_fn, use_random_maps=False):
-    """Create a wrapped env with the given obs/reward configuration."""
     if use_random_maps:
         base = gym.make("standard", render_mode=None)
     else:
@@ -391,20 +329,17 @@ def make_env(obs_fn, obs_space_fn, reward_fn, use_random_maps=False):
 
 
 # ===========================================================================
-# Main – run experiments then train final model
+# Main
 # ===========================================================================
 
 if __name__ == "__main__":
-    # ------------------------------------------------------------------
-    # Experiment matrix:  2 obs spaces × 3 reward functions = 6 runs
-    # ------------------------------------------------------------------
     experiments = [
-        ("Obs1+R1 (Flat/Sparse)",      obs1_fn, obs1_space, reward1),
-        ("Obs1+R2 (Flat/Shaped)",      obs1_fn, obs1_space, reward2),
-        ("Obs1+R3 (Flat/Dense)",       obs1_fn, obs1_space, reward3),
-        ("Obs2+R1 (Local/Sparse)",     obs2_fn, obs2_space, reward1),
-        ("Obs2+R2 (Local/Shaped)",     obs2_fn, obs2_space, reward2),
-        ("Obs2+R3 (Local/Dense-BEST)", obs2_fn, obs2_space, reward3),
+        ("Obs1+R1 (ID-grid/Sparse)",      obs1_fn, obs1_space, reward1),
+        ("Obs1+R2 (ID-grid/Shaped)",      obs1_fn, obs1_space, reward2),
+        ("Obs1+R3 (ID-grid/Dense)",       obs1_fn, obs1_space, reward3),
+        ("Obs2+R1 (Semantic/Sparse)",     obs2_fn, obs2_space, reward1),
+        ("Obs2+R2 (Semantic/Shaped)",     obs2_fn, obs2_space, reward2),
+        ("Obs2+R3 (Semantic/Dense-BEST)", obs2_fn, obs2_space, reward3),
     ]
 
     all_results = {}
@@ -419,15 +354,16 @@ if __name__ == "__main__":
         cb  = TrainingCallback()
 
         model = PPO(
-            "MlpPolicy",
+            "CnnPolicy",
             env,
-            learning_rate = 3e-4,
-            n_steps       = 2048,
-            batch_size    = 64,
-            n_epochs      = 10,
-            gamma         = 0.99,
-            ent_coef      = 0.01,
-            verbose       = 0,
+            policy_kwargs   = CNN_POLICY_KWARGS,
+            learning_rate   = 3e-4,
+            n_steps         = 2048,
+            batch_size      = 64,
+            n_epochs        = 10,
+            gamma           = 0.99,
+            ent_coef        = 0.01,
+            verbose         = 0,
         )
         model.learn(total_timesteps=EXPERIMENT_STEPS, callback=cb)
         env.close()
@@ -437,58 +373,54 @@ if __name__ == "__main__":
         all_results[label] = cb
 
         if cb.coverage_ratios:
-            last50 = cb.coverage_ratios[-50:]
-            print(f"  Avg coverage (last 50 eps): {np.mean(last50):.3f}")
+            print(f"  Avg coverage (last 50 eps): {np.mean(cb.coverage_ratios[-50:]):.3f}")
 
     plot_comparison(all_results)
 
     # ------------------------------------------------------------------
-    # Final best model: Obs2 + Reward3, two-phase training
-    # Phase 1 (70%): random maps  → broad generalisation
-    # Phase 2 (30%): predefined   → refinement on known layouts
+    # Final model: Obs2 + R3 + CNN, two-phase training
     # ------------------------------------------------------------------
     print(f"\n{'='*60}")
-    print(f"  FINAL TRAINING  (Obs2 + R3, {FINAL_STEPS:,} timesteps)")
+    print(f"  FINAL TRAINING  (Obs2-CNN + R3, {FINAL_STEPS:,} timesteps)")
     print(f"{'='*60}")
 
     env_random = make_env(obs2_fn, obs2_space, reward3, use_random_maps=True)
     final_cb   = TrainingCallback()
 
     final_model = PPO(
-        "MlpPolicy",
+        "CnnPolicy",
         env_random,
-        learning_rate = 3e-4,
-        n_steps       = 2048,
-        batch_size    = 64,
-        n_epochs      = 10,
-        gamma         = 0.99,
-        ent_coef      = 0.01,
-        verbose       = 1,
+        policy_kwargs   = CNN_POLICY_KWARGS,
+        learning_rate   = 3e-4,
+        n_steps         = 2048,
+        batch_size      = 64,
+        n_epochs        = 10,
+        gamma           = 0.99,
+        ent_coef        = 0.01,
+        verbose         = 1,
     )
 
-    phase1_steps = int(FINAL_STEPS * 0.7)
-    final_model.learn(total_timesteps=phase1_steps, callback=final_cb)
+    # Phase 1 (70%): random maps → generalisation
+    final_model.learn(total_timesteps=int(FINAL_STEPS * 0.7), callback=final_cb)
     env_random.close()
 
-    env_predefined = make_env(obs2_fn, obs2_space, reward3, use_random_maps=False)
-    final_cb2      = TrainingCallback()
-    phase2_steps   = FINAL_STEPS - phase1_steps
-    final_model.set_env(env_predefined)
-    final_model.learn(total_timesteps=phase2_steps, callback=final_cb2,
-                      reset_num_timesteps=False)
-    env_predefined.close()
+    # Phase 2 (30%): predefined maps → refinement
+    env_pre   = make_env(obs2_fn, obs2_space, reward3, use_random_maps=False)
+    final_cb2 = TrainingCallback()
+    final_model.set_env(env_pre)
+    final_model.learn(total_timesteps=FINAL_STEPS - int(FINAL_STEPS * 0.7),
+                      callback=final_cb2, reset_num_timesteps=False)
+    env_pre.close()
 
     final_model.save("best_model")
     print("\n  [saved] best_model.zip")
 
-    # Combined training curve plot
-    combined          = TrainingCallback()
+    combined = TrainingCallback()
     combined.episode_rewards = final_cb.episode_rewards + final_cb2.episode_rewards
     combined.coverage_ratios = final_cb.coverage_ratios + final_cb2.coverage_ratios
-    plot_experiment(combined, "Final Model (Obs2+R3, 2M steps)", "final_model")
+    plot_experiment(combined, "Final Model (Obs2-CNN + R3, 2M steps)", "final_model")
 
     if combined.coverage_ratios:
-        last100 = combined.coverage_ratios[-100:]
-        print(f"\n  Final avg coverage (last 100 eps): {np.mean(last100):.3f}")
+        print(f"\n  Final avg coverage (last 100 eps): {np.mean(combined.coverage_ratios[-100:]):.3f}")
 
-    print("\nDone! Check plots/ for all figures and best_model.zip for submission.")
+    print("\nDone! Check plots/ for figures and best_model.zip for submission.")
